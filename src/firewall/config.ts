@@ -31,6 +31,10 @@ export interface FirewallConfig {
 
   allowRange: boolean;
   signingSecret: string | null;
+
+  siteName: string;
+  siteTagline: string;
+  blogUrl: string | null;
 }
 
 const num = (raw: string | undefined, fallback: number, min = 0, max = Number.MAX_SAFE_INTEGER): number => {
@@ -95,6 +99,11 @@ const parse = (env: Env): FirewallConfig => {
 
     allowRange: bool(env.ALLOW_RANGE, true),
     signingSecret: (env.URL_SIGNING_SECRET ?? "").trim() || null,
+
+    // 占位页的个人化内容：fork 的人只改这几个 vars，不用动源码
+    siteName: (env.SITE_NAME ?? "").trim() || "PostPic",
+    siteTagline: (env.SITE_TAGLINE ?? "").trim(),
+    blogUrl: (env.BLOG_URL ?? "").trim() || null,
   };
 };
 
@@ -125,7 +134,13 @@ export const getConfig = (env: Env): FirewallConfig => {
     env.IMMUTABLE,
     env.STALE_WHILE_REVALIDATE_SECONDS,
     env.ALLOW_RANGE,
-    env.URL_SIGNING_SECRET ? "s" : "",
+    // 必须用密钥本身参与签名，不能只判断"有没有"：只判断存在性时，轮换密钥
+    // 前后的签名串完全相同，预热过的 isolate 会继续拿旧密钥验签——旧链接仍然
+    // 有效、新链接反而 403，直到该 isolate 被回收。轮换通常正是因为怀疑泄漏。
+    env.URL_SIGNING_SECRET ?? "",
+    env.SITE_NAME ?? "",
+    env.SITE_TAGLINE ?? "",
+    env.BLOG_URL ?? "",
   ].join("\u0000");
 
   if (cached && cached.sig === sig) return cached.cfg;

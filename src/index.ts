@@ -208,7 +208,7 @@ app.all("*", async (c) => {
     ) {
       return deny({ reason: "rate_limited", status: 429 }, url, req, { "Retry-After": "1" });
     }
-    return landingResponse(req.method === "HEAD", FIREWALL_ID);
+    return landingResponse(req.method === "HEAD", FIREWALL_ID, cfg);
   }
 
   // ---- 3. 路径清洗 -> 对象键 ----

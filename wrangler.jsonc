@@ -80,6 +80,11 @@
 		"NOT_FOUND_CACHE_SECONDS": "60",
 		"MAX_CACHE_BYTES": "33554432",
 
+		/* 根路径占位页：站点名、副标题、「前往博客」按钮（留空则不显示按钮） */
+		"SITE_NAME": "PostPic",
+		"SITE_TAGLINE": "iicemeta 的图片资源服务器",
+		"BLOG_URL": "https://www.iicemeta.com",
+
 		/* Range 分片 */
 		"ALLOW_RANGE": "true"
 	}

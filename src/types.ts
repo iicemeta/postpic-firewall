@@ -50,6 +50,14 @@ export interface Env {
   /** 非 immutable 时的 stale-while-revalidate / stale-if-error 秒数 */
   STALE_WHILE_REVALIDATE_SECONDS?: string;
 
+  // ---- 根路径占位页 ----
+  /** 页面标题里的站点名，默认 PostPic */
+  SITE_NAME?: string;
+  /** 标题下的一句话说明，留空则不显示该行 */
+  SITE_TAGLINE?: string;
+  /** 「前往博客」按钮的目标地址，留空则不显示按钮；只接受 http(s) */
+  BLOG_URL?: string;
+
   // ---- 其他 ----
   ALLOW_RANGE?: string;
   /** strict 时要求请求必须带 Referer 或同站 Sec-Fetch-Site，否则视为盗链 */
