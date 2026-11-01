@@ -1,153 +1,146 @@
-# postpic-firewall
+# PostPic Firewall
 
-`postpic.iicemeta.com` 前面的 R2 只读防火墙。所有 `/` 下的请求先被清洗、限流、鉴权，通过后才用一个明确的键去读 R2 桶；写操作、列目录、边缘直出全部不存在。
+给 Cloudflare R2 图床加一道门卫：挡住外站盗链、目录扫描和恶意刷量，顺便把带宽费压到 0。
 
-```
-client ──▶ Worker（清洗/热链/限流/验签）──▶ 边缘缓存 ──▶ R2 桶 postpic
-                 │
-                 └── 拦截：400/403/404/405/429（永不落到桶上）
-```
+An R2 firewall on Cloudflare Workers. Clean the request, then read one exact key from the bucket.
 
-## 为什么这样防"盗刷"
-
-R2 的成本不在存储，在**操作次数**（Class B 读）和**请求量**。防火墙上每一层都在回答同一个问题：这次请求有没有必要真的触达桶？
-
-| 威胁 | 防线 | 位置 |
-| --- | --- | --- |
-| 外站盗链、被当图床 | Referer 白名单 + `Cross-Origin-Resource-Policy: same-site` | `policy.ts` / `index.ts` |
-| 用 `referrerPolicy=no-referrer` 把 Referer 抹掉再盗链 | `Sec-Fetch-Site: cross-site` 单独判盗链（浏览器必带） | `policy.ts` |
-| 链接被复制后长期白嫖 | 可选 HMAC 签名 + `exp` 过期（最强，绕不过） | `signature.ts` |
-| 同一对象被反复拉取 | 边缘缓存回填，命中后零 R2 操作 | `index.ts` 步骤 7/10 |
-| `?v=随机数` 制造无限缓存未命中 | 缓存键只取归一化路径，查询串不参与 | `canonicalPath()` |
-| 遍历 `image-1..image-5000`（命名可预测） | 新键配额：一分钟内见到的新键数封顶 | `novelty.ts` |
-| 乱扫不存在的键 | 404 负缓存（默认 60s） | `index.ts` 步骤 8 |
-| 路径穿越 `../`、`%2e%2e`、`%2f`、`\` | 单次严格解码 + 段级归一化 + 编码分隔符拦截 | `policy.ts` |
-| 隐藏键、非白名单类型 | 扩展名白名单、点文件拒绝 | `policy.ts` |
-| PUT/DELETE 打穿到桶 | 方法白名单，只放 GET/HEAD/OPTIONS | `index.ts` 步骤 1 |
-| 单 IP 暴力刷量 | 令牌桶（缓存命中 1 点 / 回源 4 点 / Range 3 点） | `limiter.ts` |
-| 上传者塞 `text/html` 借域名做 XSS | Content-Type 只按扩展名推断，忽略桶内元数据；SVG/XML 追加 CSP sandbox | `mime.ts` |
-| 攻击者用日志量刷账单 | 热链/限流两类高频拦截 1/20 采样日志 | `index.ts` |
-
-## 首屏突发：为什么 burst 是 800
-
-博客没有懒加载，一篇文章首屏会并发拉 40-50 张图。冷缓存下每张都要回源，按回源 4 点算：
-
-```
-50 张 × 4 点 = 200 点    ← 一次首屏的瞬时开销
-800 / 4      = 200 张    ← burst 能吞下的冷图数量
+```mermaid
+flowchart LR
+  A[访客浏览器] --> B[Worker<br/>清洗 / 查来源 / 限流]
+  B -->|放行| C[Cloudflare 边缘缓存]
+  C -->|未命中才回源| D[(R2 桶)]
+  B -->|拦下 400 / 403 / 429| E[不碰桶]
 ```
 
-如果 burst 停在 150，第 38 张就会 429，而浏览器对破图**不会重试**，结果是静默的一排空图。所以这里把 burst 放得很宽（800），把"防刷"的职责交给下面那层。
+## 它拦什么
 
-## 新键配额：真正挡遍历的那一层
+| 有人想干的事 | 门卫怎么处理 |
+| --- | --- |
+| 把你的图贴到自己网站 | 看请求来自哪个页面，站外一律拒绝 |
+| 猜 `image-1.png`、`image-2.png` 一直猜下去 | 每 IP 每分钟最多认 600 个"新图"，猜多了就拒 |
+| 疯狂重复请求同一张图 | 边缘缓存只回源一次，之后不再产生 R2 费用 |
+| 用 `../`、`%2e%2e`、`%2f` 爬出目录 | 地址解不干净就拒绝，绝不"猜"路径 |
+| 用 PUT / DELETE 改桶里的东西 | 只放行 GET / HEAD / OPTIONS，写操作到不了桶 |
+| 上传一个 html 借你的域名做坏事 | 类型只按扩展名判断，忽略桶里存的声明 |
 
-容器里的图片大多是 `image.png`、`image-1.png` 这类可预测且同名会被覆盖的命名。目录一旦暴露，遍历 `image-1..image-5000` 的成本极低，而这类请求恰好绕开了两个已有机制：每个键都是新的，边缘缓存不命中；速率可以压得很低，令牌桶不报警。
+## 部署（大约 5 分钟）
 
-所以换一个维度计数：**同一个 IP 在一个窗口内见到多少个不同的键**。
+> 为什么不直接放一个"一键部署"按钮？因为 `wrangler.jsonc` 是本仓库作者自己的线上配置（桶名、域名都是他的），直接点部署会在"桶不存在"这一步失败。先 Fork 改成你自己的，再点部署，一次就能成。
 
-| 行为 | 一分钟新键数 | 结果 |
-| --- | --- | --- |
-| 看 1 篇文章（50 张图） | 50 | 放行 |
-| 连翻 10 篇 | 500 | 放行 |
-| 重复看同一批图 | 0（已见过） | 放行，随便看 |
-| 遍历目录 | 几千 | 撞 429 |
+### 1. 先有一个 R2 桶
 
-默认 `NOVELTY_MAX_KEYS=600`（一分钟 12 篇文章），`NOVELTY_WINDOW_SECONDS=60`。只在缓存未命中、真的要回源 R2 时才计数。
+Cloudflare 后台 → **R2** → **Create bucket**，把图片传进去。记住桶名。
 
-## 请求处理顺序
+### 2. Fork 这个仓库
 
-1. 方法白名单（GET / HEAD / OPTIONS）
-2. CORS 预检（不触桶）
-3. 路径 → 对象键清洗
-4. Referer 热链检查
-5. URL 签名校验（设了 `URL_SIGNING_SECRET` 才启用）
-6. 限流
-7. 边缘缓存查询 → 命中直接返回
-8. 新键配额（只在未命中、真的要回源时计数）
-9. 回源 R2（`head()` / `get()`，Range 与 `If-None-Match` 下推）
-10. 响应加固（nosniff / CORP / CSP / Content-Disposition / ETag / 304）
-11. 回填边缘缓存
+点右上角 **Fork**。后面的修改都在你自己的仓库里做，这样点部署按钮时用的是你的配置。
 
-拦截响应永远是小 body + `Cache-Control: no-store`，真实原因只写在 `X-Firewall-Block` 头里——排查时看这个头就知道是哪一层挡的。所有响应都带 `X-Firewall` 和 `X-Firewall-Cache`（`HIT` / `MISS` / `BYPASS`）。
+### 3. 改三处
 
-## 配置
+在 GitHub 网页上打开 `wrangler.jsonc`，点铅笔图标，改这三处就行：
 
-`wrangler.jsonc` 的 `vars`，全部可选：
+**① 桶名**
 
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `ALLOWED_EXTENSIONS` | 见配置 | 允许的扩展名，留空 = 不限制 |
-| `ENFORCE_EXTENSION` | `false` | `true` 时无扩展名请求一律 403，可挡批量探测 |
-| `ALLOW_DOTFILES` | `false` | 是否放行 `.` 开头的键 |
-| `KEY_MAX_LENGTH` / `SEGMENT_MAX_LENGTH` | `1024` / `255` | 键与单段长度上限 |
-| `HOTLINK_MODE` | `block` | `off` 关闭 Referer 检查 |
-| `HOTLINK_STRICT` | `false` | `true` 时要求必须带 Referer 或同站 `Sec-Fetch-Site`，连 curl 这类脚本客户端一起挡 |
-| `ALLOWED_REFERER_HOSTS` | `www.iicemeta.com,iicemeta.com,postpic.iicemeta.com` | 博客在 `www.iicemeta.com`；`iicemeta.com` 按后缀匹配等于放行全部子域。无 Referer 且非 cross-site 放行 |
-| `ALLOWED_ORIGIN_HOSTS` | 同上 | CORS 反射白名单 |
-| `CORP` | `same-site` | `same-origin` / `cross-origin` / 空 = 不发 |
-| `RATE_LIMIT_MODE` / `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` | `on` / `40` / `800` | 令牌桶，装的是瞬时并发 |
-| `NOVELTY_MODE` / `NOVELTY_WINDOW_SECONDS` / `NOVELTY_MAX_KEYS` | `on` / `60` / `600` | 新键配额，装的是枚举 |
-| `CDN_CACHE_SECONDS` | `3600` | 边缘 + 浏览器缓存时长，`0` 关闭缓存 |
-| `IMMUTABLE` | `false` | 对象名带内容 hash 时才开；开了就别指望换图立刻生效 |
-| `STALE_WHILE_REVALIDATE_SECONDS` | `86400` | 过期后继续供旧图、后台刷新的窗口 |
-| `NOT_FOUND_CACHE_SECONDS` | `60` | 404 负缓存时长 |
-| `MAX_CACHE_BYTES` | `33554432` | 超过此大小的对象不进边缘缓存，`0` = 不限制 |
-| `ALLOW_RANGE` | `true` | `false` 时忽略 Range，一律整对象返回 |
+```diff
+- "bucket_name": "postpic"
++ "bucket_name": "你的桶名"
+```
 
-密钥只走 secret：
+**② 域名** —— 第一次部署建议先整段删掉，用 Cloudflare 送的 `xxx.workers.dev` 测试。跑通之后再回来填自己的域名。
+
+```diff
+- "routes": [
+-   {
+-     "pattern": "postpic.iicemeta.com",
+-     "custom_domain": true
+-   }
+- ],
++ // 第一次部署先留空，成功后在后台 Workers → Settings → Domains & Routes 里绑定
+```
+
+**③ 允许谁引用你的图** —— 填你博客的域名（子域会自动包含，用英文逗号分隔）
+
+```diff
+- "ALLOWED_REFERER_HOSTS": "www.iicemeta.com,iicemeta.com,postpic.iicemeta.com",
+- "ALLOWED_ORIGIN_HOSTS": "www.iicemeta.com,iicemeta.com,postpic.iicemeta.com",
++ "ALLOWED_REFERER_HOSTS": "你的博客.com",
++ "ALLOWED_ORIGIN_HOSTS": "你的博客.com",
+```
+
+顺手可以把占位页文案改成自己的（就在下面几行）：
+
+```jsonc
+"SITE_NAME": "PostPic",                       // 页面大标题
+"SITE_TAGLINE": "我的图片资源服务器",           // 副标题，留空不显示
+"BLOG_URL": "https://你的博客.com",            // 按钮链接，留空不显示按钮
+```
+
+### 4. 部署
+
+把这个地址里的用户名换成你自己的，然后在浏览器里打开：
+
+```
+https://deploy.workers.cloudflare.com/?url=https://github.com/你的用户名/postpic-firewall
+```
+
+登录 Cloudflare → 确认 → 等 1 分钟。部署完成后会给你一个 `https://xxx.workers.dev` 地址。
+
+### 5. 看看成不成
 
 ```bash
-npx wrangler secret put URL_SIGNING_SECRET
+curl -I https://xxx.workers.dev/你的图片.jpg
 ```
 
-## 开发与验证
+响应头里出现 `X-Firewall: postpic-firewall/1` 就说明门卫在岗。再打开 `https://xxx.workers.dev/` 应该看到一张说明页，而不是 404。
+
+## 出问题了看这里
+
+拦截时响应头里有一个 `X-Firewall-Block`，告诉你卡在哪一步：
+
+| 看到这个 | 意思 | 怎么改 |
+| --- | --- | --- |
+| `hotlink` | 请求来自站外 | 把博客域名加进 `ALLOWED_REFERER_HOSTS` |
+| `extension_not_allowed` | 文件类型不在白名单 | 把扩展名加进 `ALLOWED_EXTENSIONS` |
+| `dotfile` | 路径里有 `.` 开头的段 | 正常情况不该出现，别放行 |
+| `novelty_quota` | 一分钟内看的"新图"太多 | 阈值调大 `NOVELTY_MAX_KEYS` |
+| `rate_limited` | 请求太密 | 调大 `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` |
+
+**改了配置不生效？** 重启一次部署（改完 `wrangler.jsonc` 再 push 一次，或在后台点重新部署）。
+
+**博客一篇文章 50 张图，怕被自己限流？** 默认参数是按"首屏 50 张冷图"算过的，不用动。真要调，`RATE_LIMIT_BURST` 至少要是"图片数 × 4"。
+
+**桶里没有扩展名的文件取不到？** 把 `ENFORCE_EXTENSION` 留成 `false`，或者给文件加上扩展名。
+
+**门卫会被绕过去吗？** 只要 R2 桶自己不再挂自定义域、也不开 `r2.dev`，公网就只剩 Worker 这一条路。这是整套方案的前提，千万别两边同时开。
+
+<details>
+<summary>进阶：环境变量速查</summary>
+
+全部写在 `wrangler.jsonc` 的 `vars` 里，每个都有注释。常用的几个：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ALLOWED_REFERER_HOSTS` | — | 允许引用图片的站点，子域自动放行 |
+| `ALLOWED_EXTENSIONS` | 图片/视频/字体等 30 多种 | 允许访问的文件类型，留空=不限制 |
+| `RATE_LIMIT_BURST` / `RATE_LIMIT_RPS` | `800` / `40` | 瞬时并发 / 每秒回填速率 |
+| `NOVELTY_MAX_KEYS` | `600` | 每分钟允许出现的"不同图片"数量，挡扫描的关键 |
+| `CDN_CACHE_SECONDS` | `3600` | 图片缓存时长。文件名带内容 hash 才能调大 |
+| `IMMUTABLE` | `false` | 文件名永不变时打开，配合超长缓存 |
+| `URL_SIGNING_SECRET` | 未设置 | 设置后所有图片必须带签名链接，最狠的一层 |
+
+`URL_SIGNING_SECRET` 不是变量是 secret，用 `npx wrangler secret put URL_SIGNING_SECRET` 设置。开启前想清楚：它会把每张图变成"有有效期的链接"（最长 30 天），静态博客里的老文章会过期变空图，通常只在被人恶意刷的时候临时打开。
+
+本地开发：
 
 ```bash
 npm install
-npm run typecheck   # tsc --noEmit
-npm run dev         # wrangler dev，本地 R2 模拟
-npm run deploy
+npm run dev        # 本地起服务
+npm run typecheck  # 类型检查
+bash scripts/smoke.sh  # 38 项回归用例
 ```
 
-往本地模拟桶放测试对象：
+</details>
 
-```bash
-npx wrangler r2 object put postpic/smoke/hello.png --file=./x.png --local
-```
+## 许可证
 
-## 签名链接
-
-```bash
-# Git Bash 下必须加 MSYS_NO_PATHCONV=1，否则 /a/b.png 会被改写成 C:/...
-MSYS_NO_PATHCONV=1 URL_SIGNING_SECRET=xxx npm run sign -- /2026/photo.jpg --ttl 3600 --base https://postpic.iicemeta.com
-# -> https://postpic.iicemeta.com/2026/photo.jpg?exp=...&sig=...
-```
-
-签名对象是**清洗后的对象键**（无前导斜杠）与 `exp` 的 HMAC-SHA256，有效期上限 30 天。启用后所有请求都必须带签名，裸链接直接 403。
-
-## 根路径占位页
-
-`/`（含多斜杠）与 `/index.html` 返回一个内联的占位页，说明"这是图床不是网站"，并指向博客。除此之外一切照旧：深层路径仍是 404。
-
-- 页面写在 `src/firewall/landing.ts` 的模板字符串里，**不能放进 `public/`**——`assets` 绑定已移除，静态文件会在 Worker 之前直出，等于绕过全部清洗。
-- 零外部依赖：不外链字体、不外链图片，正文用 `system-ui` 近似 Inter，图标是内联 SVG。这样才能给页面配 `CSP: default-src 'none'`。
-- 配色对齐博客（Nuxt 站的 `--hue-theme: 220deg`）：主色 `hsl(220 100% 55%)`、页面底 `hsl(220 20% 98%)`、暗色 `hsl(220 0% 7%)` / `hsl(220 100% 70%)`，跟随 `prefers-color-scheme`。
-- 在路径清洗之前判断，因此不受扩展名白名单和热链检查约束，但**计入限流**（被刷时一样挡）。
-- `Cache-Control: public, max-age=600`，附 `X-Robots-Tag: noindex`。
-
-## 上线状态与注意
-
-已部署，`postpic.iicemeta.com` 由 Worker 独占（R2 桶侧无任何自定义域，不存在域名争用）。DNS 记录由 `wrangler deploy` 的 custom domain 接管。
-
-- 本仓库已移除静态资源绑定（`assets`）：保留它会让 `public/` 下的文件在 Worker 之前被直出，等于留一条绕过清洗的通道。
-- Worker 只读桶，不提供上传接口；上传仍走你自己的流程。
-- **缓存纪元**：`caches.default` 与 Cloudflare 边缘缓存是同一层。R2 直连时期图片已被缓进这一层（R2 默认 `max-age=14400`、无任何加固头），Worker 若用同样格式的键去 `match()` 会把它们当成自己的缓存命中。因此缓存键带 `__fw-v1` 前缀（`index.ts` 的 `CACHE_EPOCH`），新旧彻底隔离；旧条目自行过期。改动缓存语义（响应头、编码方式）时需要递增这个纪元号。
-- 缓存副本的 `Cache-Control` 会被 zone 的 Browser Cache TTL 改写（实测 3600 进、14400 出），所以 HIT / 304 分支按配置重新盖回 `cacheControlFor()` 的结果，浏览器端 TTL 始终等于 `CDN_CACHE_SECONDS`。
-
-## 已知边界
-
-- 限流与新键配额都是 **isolate 内存级**：N 个 isolate 就有 N 倍预算，冷启动会重置。挡单点刷量够用，扛不住分布式换 IP。要硬上限请叠加 Cloudflare WAF 速率规则（按 `ip` + `http.request.uri.path`）。
-- 默认只缓存 1 小时，是"换图要及时生效"和"少回源"之间的折中。因为对象名 `image.png` 会被同名覆盖，上了 immutable + 长 TTL 就等于换图要等一周。彻底解法是让文件名带内容 hash（`image-<hash>.png`），然后 `IMMUTABLE=true` + `CDN_CACHE_SECONDS=31536000`，可以做到永不回源。
-- 缓存过期后由 `stale-while-revalidate` 兜着：期间继续发旧图、后台回源刷新，避免图集页同时过期时把 R2 打出一波尖峰。
-- Range 请求不走边缘缓存，限流上只计入口那 1 点（不追加回源权重）。纯图站建议 `ALLOW_RANGE=false`，让重复读全部落在缓存上。
-- 无 Referer 且 `Sec-Fetch-Site: cross-site` 才判盗链。要连"不带任何浏览器头"的脚本客户端一起挡，打开 `HOTLINK_STRICT`——代价是 wget / RSS 阅读器 / 图片代理全部 403。
+[MIT](LICENSE)
