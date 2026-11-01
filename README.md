@@ -125,6 +125,16 @@ MSYS_NO_PATHCONV=1 URL_SIGNING_SECRET=xxx npm run sign -- /2026/photo.jpg --ttl 
 
 签名对象是**清洗后的对象键**（无前导斜杠）与 `exp` 的 HMAC-SHA256，有效期上限 30 天。启用后所有请求都必须带签名，裸链接直接 403。
 
+## 根路径占位页
+
+`/`（含多斜杠）与 `/index.html` 返回一个内联的占位页，说明"这是图床不是网站"，并指向博客。除此之外一切照旧：深层路径仍是 404。
+
+- 页面写在 `src/firewall/landing.ts` 的模板字符串里，**不能放进 `public/`**——`assets` 绑定已移除，静态文件会在 Worker 之前直出，等于绕过全部清洗。
+- 零外部依赖：不外链字体、不外链图片，正文用 `system-ui` 近似 Inter，图标是内联 SVG。这样才能给页面配 `CSP: default-src 'none'`。
+- 配色对齐博客（Nuxt 站的 `--hue-theme: 220deg`）：主色 `hsl(220 100% 55%)`、页面底 `hsl(220 20% 98%)`、暗色 `hsl(220 0% 7%)` / `hsl(220 100% 70%)`，跟随 `prefers-color-scheme`。
+- 在路径清洗之前判断，因此不受扩展名白名单和热链检查约束，但**计入限流**（被刷时一样挡）。
+- `Cache-Control: public, max-age=600`，附 `X-Robots-Tag: noindex`。
+
 ## 上线状态与注意
 
 已部署，`postpic.iicemeta.com` 由 Worker 独占（R2 桶侧无任何自定义域，不存在域名争用）。DNS 记录由 `wrangler deploy` 的 custom domain 接管。

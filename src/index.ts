@@ -6,9 +6,13 @@ import { takeToken } from "./firewall/limiter";
 import { takeNovelty } from "./firewall/novelty";
 import { verifySignature } from "./firewall/signature";
 import { contentDisposition, contentTypeFor, needsSandboxCsp } from "./firewall/mime";
+import { landingResponse } from "./firewall/landing";
 
 const FIREWALL_ID = "postpic-firewall/1";
 const ALLOWED_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/** 根路径与 /index.html 走占位页，不读桶（桶里没有 html，扩展名白名单也不放行） */
+const ROOT_PATH = /^\/+$|^\/index\.html?$/i;
 const SANDBOX_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
 /**
@@ -191,6 +195,20 @@ app.all("*", async (c) => {
         "Cache-Control": "no-store",
       },
     });
+  }
+
+  // ---- 2.5 根路径占位页：不进 R2、不写缓存 ----
+  // 放在路径清洗之前，因为 "/" 归一化后本来就是 empty_key。占位页是公开说明页，
+  // 不参与热链检查，但仍然计入限流（被刷的时候一样要挡住）。
+  if (ROOT_PATH.test(url.pathname)) {
+    const landingIp = clientIp(req);
+    if (
+      cfg.rateLimitEnabled &&
+      !takeToken(`ip:${landingIp}`, 1, { rps: cfg.rateLimitRps, burst: cfg.rateLimitBurst })
+    ) {
+      return deny({ reason: "rate_limited", status: 429 }, url, req, { "Retry-After": "1" });
+    }
+    return landingResponse(req.method === "HEAD", FIREWALL_ID);
   }
 
   // ---- 3. 路径清洗 -> 对象键 ----
