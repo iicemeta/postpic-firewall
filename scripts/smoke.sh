@@ -2,14 +2,18 @@
 # 防火墙回归矩阵。先造对象再跑：
 #   npx wrangler r2 object put postpic/smoke/hello.png --file=./x.png --local
 #   npx wrangler r2 object put postpic/smoke/three.png --file=./x.png --local
+#   npx wrangler r2 object put postpic/smoke/fresh.png --file=./x.png --local
 #   npm run dev &
 #   BASE=http://127.0.0.1:8788 bash scripts/smoke.sh
 #
-# 加 --bench 追加并发压测（验证令牌桶，需要 node ≥ 18 的 fetch）。
+# 注意：本地边缘缓存落盘在 .wrangler/state/v3/cache，改过缓存相关 vars 后
+# 要停掉 dev 再清掉它，否则会读到上一轮写进去的旧响应头。
+#
+# 加 --bench 追加 300 新键并发（验证 burst 与新键配额）。
 set -u
 
 BASE="${BASE:-http://127.0.0.1:8788}"
-ASSET="${ASSET:-/smoke/hello.png}"
+ASSET="${ASSET:-/smoke/fresh.png}"
 PASS=0
 FAIL=0
 
@@ -28,6 +32,39 @@ check() { # name expect_status [curl args...]
   else
     FAIL=$((FAIL + 1)); printf 'FAIL  %-46s got=%s want=%s %s\n' "$name" "$status" "$expect" "$reason"
   fi
+}
+
+has_header() { # name pattern [curl args...]
+  local name="$1" pattern="$2"; shift 2
+  if header_of "$@" | grep -qi -- "$pattern"; then
+    PASS=$((PASS + 1)); printf 'PASS  %-46s %s\n' "$name" "$pattern"
+  else
+    FAIL=$((FAIL + 1)); printf 'FAIL  %-46s 缺少 %s\n' "$name" "$pattern"
+  fi
+}
+
+lacks_header() { # name pattern [curl args...]
+  local name="$1" pattern="$2"; shift 2
+  if header_of "$@" | grep -qi -- "$pattern"; then
+    FAIL=$((FAIL + 1)); printf 'FAIL  %-46s 不该出现 %s\n' "$name" "$pattern"
+  else
+    PASS=$((PASS + 1)); printf 'PASS  %-46s 无 %s\n' "$name" "$pattern"
+  fi
+}
+
+# 真并发：模板里的 {i} 会被替换成序号
+load() { # label template count
+  local label="$1" tpl="$2" n="$3" out
+  out=$(node -e '
+    const tpl = process.argv[1], n = Number(process.argv[2]);
+    Promise.all(Array.from({ length: n }, (_, i) =>
+      fetch(tpl.replace("{i}", String(i))).then((r) => r.status).catch(() => "ERR")))
+      .then((s) => {
+        const c = s.reduce((a, x) => ((a[x] = (a[x] || 0) + 1), a), {});
+        console.log(JSON.stringify(c));
+      });
+  ' "$tpl" "$n")
+  printf '%-46s %s\n' "$label" "$out"
 }
 
 ETAG=$(header_of "$BASE$ASSET" | grep -i '^etag:' | sed 's/^[Ee][Tt]ag: //')
@@ -67,6 +104,9 @@ check "后缀伪装 Referer"                403 -H "Referer: https://iicemeta.co
 check "子域 Referer 放行"               200 -H "Referer: https://blog.iicemeta.com/post" "$BASE$ASSET"
 check "同域 Referer 放行"               200 -H "Referer: https://postpic.iicemeta.com/" "$BASE$ASSET"
 check "无 Referer 直连放行"             200 "$BASE$ASSET"
+check "无 Referer + cross-site 判盗链"   403 -H "Sec-Fetch-Site: cross-site" "$BASE$ASSET"
+check "无 Referer + none 放行"          200 -H "Sec-Fetch-Site: none" "$BASE$ASSET"
+check "无 Referer + same-site 放行"     200 -H "Sec-Fetch-Site: same-site" "$BASE$ASSET"
 
 echo "--- 方法 ---"
 check "POST 拒绝"                       405 -X POST "$BASE$ASSET"
@@ -82,20 +122,24 @@ echo "--- 404 负缓存 ---"
 check "不存在的键"                      404 "$BASE/smoke/nope.png"
 check "不存在键二次请求"                 404 "$BASE/smoke/nope.png"
 
+echo "--- 缓存头（同名覆盖的 image.png 命名，不能上 immutable 长 TTL）---"
+has_header "带 stale-while-revalidate"  "stale-while-revalidate=86400" "$BASE$ASSET"
+has_header "max-age 为 3600"            "max-age=3600" "$BASE$ASSET"
+lacks_header "不含 immutable"           "immutable" "$BASE$ASSET"
+
+echo
+echo "--- 首屏突发：一篇文章 40-50 张冷图并发，不能被限流打断 ---"
+RID=$(date +%s)
+load "50 个新键并发（冷缓存模拟首屏）" "$BASE/smoke/first-$RID-{i}.png" 50
+load "重复访问同一批图（应全部命中缓存）" "$BASE$ASSET?cb=$RID-{i}" 50
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 
 if [ "${1:-}" = "--bench" ]; then
   echo
-  echo "--- 并发压测 300 次（burst / rps 见 vars）---"
-  node -e '
-    const n = 300, url = process.argv[1], t0 = Date.now();
-    Promise.all(Array.from({ length: n }, () => fetch(url).then((r) => r.status)))
-      .then((s) => {
-        const c = s.reduce((a, x) => ((a[x] = (a[x] || 0) + 1), a), {});
-        console.log("elapsed_ms", Date.now() - t0, JSON.stringify(c));
-      });
-  ' "$BASE$ASSET"
+  echo "--- 300 个新键并发（应撞到 burst / 新键配额）---"
+  load "300 个不同键" "$BASE/smoke/bench-$RID-{i}.png" 300
 fi
 
 [ "$FAIL" -eq 0 ] || exit 1

@@ -3,6 +3,7 @@ import type { Env } from "./types";
 import { getConfig, type FirewallConfig } from "./firewall/config";
 import { checkReferer, originAllowed, resolveObjectKey, type Block } from "./firewall/policy";
 import { takeToken } from "./firewall/limiter";
+import { takeNovelty } from "./firewall/novelty";
 import { verifySignature } from "./firewall/signature";
 import { contentDisposition, contentTypeFor, needsSandboxCsp } from "./firewall/mime";
 
@@ -95,6 +96,22 @@ const applyCors = (headers: Headers, origin: string | null, cfg: FirewallConfig)
   headers.set("Vary", "Origin");
 };
 
+/**
+ * 缓存策略。桶里的对象名是 image.png、image-1.png 这种可预测且会被同名覆盖的写法，
+ * 长 TTL + immutable 会让换图在缓存期内一直看不到，所以默认只给 1 小时，
+ * 再用 stale-while-revalidate 让过期后的高并发请求继续吃旧图、不被回源阻塞。
+ * 对象名带内容 hash 时把 IMMUTABLE 打开，才适合上 immutable + 超长 TTL。
+ */
+const cacheControlFor = (cfg: FirewallConfig, noStore: boolean): string => {
+  if (noStore || cfg.cacheSeconds === 0) return "no-store";
+  const base = `public, max-age=${cfg.cacheSeconds}`;
+  if (cfg.immutable) return `${base}, immutable`;
+  if (cfg.staleWhileRevalidateSeconds > 0) {
+    return `${base}, stale-while-revalidate=${cfg.staleWhileRevalidateSeconds}, stale-if-error=${cfg.staleWhileRevalidateSeconds}`;
+  }
+  return base;
+};
+
 /** If-None-Match 匹配（弱比较：忽略 W/ 前缀） */
 const etagMatches = (header: string | null, etag: string): boolean => {
   if (!header) return false;
@@ -168,7 +185,7 @@ app.all("*", async (c) => {
   const key = resolved.key;
 
   // ---- 4. 热链防护 ----
-  const refererBlock = checkReferer(req.headers.get("referer"), host, cfg);
+  const refererBlock = checkReferer(req.headers, host, cfg);
   if (refererBlock) return deny(refererBlock, url, req);
 
   // ---- 5. URL 签名（可选但最强）----
@@ -213,6 +230,17 @@ app.all("*", async (c) => {
     }
   }
 
+  // ---- 7.5 新键配额：走到这里说明缓存没命中，这次回源会真的花 R2 操作 ----
+  // 计数维度是"一分钟内见过多少个不同键"，所以正常翻文章不受影响，遍历目录会撞墙。
+  if (
+    cfg.noveltyEnabled &&
+    !takeNovelty(`ip:${ip}`, key, cfg.noveltyWindowSeconds * 1000, cfg.noveltyMaxKeys)
+  ) {
+    return deny({ reason: "novelty_quota", status: 429 }, url, req, {
+      "Retry-After": String(cfg.noveltyWindowSeconds),
+    });
+  }
+
   // ---- 8. 回源 R2 ----
   let obj: R2Object | R2ObjectBody | null;
   try {
@@ -222,6 +250,12 @@ app.all("*", async (c) => {
       const only = new Headers();
       only.set("range", range);
       obj = await c.env.BUCKET.get(key, { range: only });
+    } else if (req.headers.get("if-none-match")) {
+      // 把客户端的 If-None-Match 下推给 R2：未变更时只回元数据，不传 body。
+      // 浏览器重复访问同一张图时，这一条能省掉整份 egress。
+      const cond = new Headers();
+      cond.set("if-none-match", req.headers.get("if-none-match") as string);
+      obj = await c.env.BUCKET.get(key, { onlyIf: cond });
     } else {
       obj = await c.env.BUCKET.get(key);
     }
@@ -246,26 +280,26 @@ app.all("*", async (c) => {
   // ---- 9. 组装响应 ----
   const contentType = contentTypeFor(key);
   const etag = obj.httpEtag || `"${obj.etag}"`;
+  // 只有 GET 且下推了 If-None-Match 时，"没有 body"才意味着未变更；
+  // HEAD 走的 head() 本来就不带 body，不能当成 304。
+  const upstreamNotModified =
+    !isHead && !range && req.headers.get("if-none-match") !== null && typeof (obj as R2ObjectBody).body === "undefined";
 
-  headers.set("Content-Type", contentType);
   headers.set("ETag", etag);
   headers.set("Last-Modified", new Date(obj.uploaded).toUTCString());
-  headers.set("X-Content-Type-Options", "nosniff");
-  headers.set("Content-Disposition", contentDisposition(key, contentType));
   headers.set("Accept-Ranges", cfg.allowRange ? "bytes" : "none");
+  headers.set("Cache-Control", cacheControlFor(cfg, range !== null));
   if (cfg.corp) headers.set("Cross-Origin-Resource-Policy", cfg.corp);
-  if (needsSandboxCsp(contentType)) headers.set("Content-Security-Policy", SANDBOX_CSP);
-  headers.set(
-    "Cache-Control",
-    range || cfg.cacheSeconds === 0
-      ? "no-store"
-      : `public, max-age=${cfg.cacheSeconds}, immutable`,
-  );
 
   // 条件请求：命中就 304，连 body 都不生成
-  if (!range && etagMatches(req.headers.get("if-none-match"), etag)) {
+  if (upstreamNotModified || (!range && etagMatches(req.headers.get("if-none-match"), etag))) {
     return notModified(headers, "MISS");
   }
+
+  headers.set("Content-Type", contentType);
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Content-Disposition", contentDisposition(key, contentType));
+  if (needsSandboxCsp(contentType)) headers.set("Content-Security-Policy", SANDBOX_CSP);
 
   // Range 分片：不写边缘缓存，避免一份对象被上千个不同区间反复回源
   if (range) {

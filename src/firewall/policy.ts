@@ -18,6 +18,7 @@ export type BlockReason =
   | "hotlink"
   | "bad_signature"
   | "rate_limited"
+  | "novelty_quota"
   | "method_not_allowed"
   | "range_invalid"
   | "upstream_error";
@@ -131,14 +132,32 @@ const hostMatches = (host: string, allowed: readonly string[]): boolean => {
   return false;
 };
 
-/** 热链检查：无 Referer 视为直连放行（bookmark / curl / referrerPolicy=no-referrer） */
-export const checkReferer = (
-  referer: string | null,
-  requestHost: string,
-  cfg: FirewallConfig,
-): Block | null => {
+/**
+ * 热链检查。
+ *
+ * 默认策略对"没有 Referer"放行（地址栏直达、书签、聊天软件里贴链接都得能用），
+ * 但 referrerPolicy=no-referrer 让外站页面也能做到"没 Referer"，所以这里再补一层
+ * Sec-Fetch-Site：外站页面发起的子资源请求会被标成 cross-site，直接算盗链。
+ * 浏览器必定会带这个头，脚本客户端则可以不带——要连脚本一起挡就把 HOTLINK_STRICT 打开。
+ */
+export const checkReferer = (headers: Headers, requestHost: string, cfg: FirewallConfig): Block | null => {
   if (cfg.hotlinkMode === "off") return null;
-  if (!referer) return null;
+
+  const referer = headers.get("referer");
+  const fetchSite = (headers.get("sec-fetch-site") ?? "").trim().toLowerCase();
+
+  if (!referer) {
+    if (fetchSite === "cross-site") {
+      return { reason: "hotlink", status: 403 };
+    }
+    if (cfg.hotlinkStrict) {
+      const browserLike = fetchSite === "none" || fetchSite === "same-origin" || fetchSite === "same-site";
+      if (!browserLike) {
+        return { reason: "bad_referer", status: 403 };
+      }
+    }
+    return null;
+  }
 
   let host: string;
   try {

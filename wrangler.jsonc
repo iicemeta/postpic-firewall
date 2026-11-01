@@ -43,19 +43,33 @@
 		"KEY_MAX_LENGTH": "1024",
 		"SEGMENT_MAX_LENGTH": "255",
 
-		/* 热链防护：允许的主机及其子域放行，无 Referer 放行 */
+		/* 热链防护：允许的主机及其子域放行，无 Referer 放行；cross-site 的 Sec-Fetch-Site 视为盗链 */
 		"HOTLINK_MODE": "block",
+		"HOTLINK_STRICT": "false",
 		"ALLOWED_REFERER_HOSTS": "postpic.iicemeta.com,iicemeta.com",
 		"ALLOWED_ORIGIN_HOSTS": "postpic.iicemeta.com,iicemeta.com",
 		"CORP": "same-site",
 
-		/* 限流（单 isolate 令牌桶，best-effort） */
+		/*
+		 * 限流：一篇文章没有懒加载，首屏会并发拉 40-50 张图，冷缓存下每张 4 点 = 200 点，
+		 * 所以 burst 必须远大于 200，否则首屏会被自己限流打成一片破图。
+		 */
 		"RATE_LIMIT_MODE": "on",
-		"RATE_LIMIT_RPS": "25",
-		"RATE_LIMIT_BURST": "150",
+		"RATE_LIMIT_RPS": "40",
+		"RATE_LIMIT_BURST": "800",
 
-		/* 缓存 */
-		"CDN_CACHE_SECONDS": "604800",
+		/*
+		 * 新键配额：真正挡遍历的是这一层。同名覆盖的 image.png 命名可预测，
+		 * 遍历 image-1..image-5000 成本极低，但正常访客一分钟也翻不到 600 个新键。
+		 */
+		"NOVELTY_MODE": "on",
+		"NOVELTY_WINDOW_SECONDS": "60",
+		"NOVELTY_MAX_KEYS": "600",
+
+		/* 缓存：对象名不带内容 hash 且会被同名覆盖，1 小时 TTL + SWR，换图不用等一周 */
+		"CDN_CACHE_SECONDS": "3600",
+		"IMMUTABLE": "false",
+		"STALE_WHILE_REVALIDATE_SECONDS": "86400",
 		"NOT_FOUND_CACHE_SECONDS": "60",
 		"MAX_CACHE_BYTES": "33554432",
 

@@ -34,14 +34,26 @@ export interface Env {
   /** off 关闭限流 */
   RATE_LIMIT_MODE?: string;
 
+  // ---- 新键配额：只限制"一分钟见到多少不同对象"，放过重复访问 ----
+  /** off 关闭 */
+  NOVELTY_MODE?: string;
+  NOVELTY_WINDOW_SECONDS?: string;
+  NOVELTY_MAX_KEYS?: string;
+
   // ---- 缓存 ----
   CDN_CACHE_SECONDS?: string;
   NOT_FOUND_CACHE_SECONDS?: string;
   /** 超过该字节数不进边缘缓存（0 = 不限制） */
   MAX_CACHE_BYTES?: string;
+  /** 对象名带内容 hash 时可开：加 immutable，省掉重验证 */
+  IMMUTABLE?: string;
+  /** 非 immutable 时的 stale-while-revalidate / stale-if-error 秒数 */
+  STALE_WHILE_REVALIDATE_SECONDS?: string;
 
   // ---- 其他 ----
   ALLOW_RANGE?: string;
+  /** strict 时要求请求必须带 Referer 或同站 Sec-Fetch-Site，否则视为盗链 */
+  HOTLINK_STRICT?: string;
   /** 设置后强制校验 URL 签名（HMAC-SHA256），未设置则不校验 */
   URL_SIGNING_SECRET?: string;
 }
