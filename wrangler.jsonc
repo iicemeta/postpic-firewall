@@ -7,35 +7,66 @@
 	"name": "postpic-firewall",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-10-23",
-	"assets": {
-		"binding": "ASSETS",
-		"directory": "./public"
-	},
 	"observability": {
 		"enabled": true
 	},
-	"upload_source_maps": true
+	"upload_source_maps": true,
+
 	/**
-	 * Smart Placement
-	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
+	 * 唯一数据源：R2 存储桶。Worker 只读不写。
+	 * 静态资源绑定（assets）已移除 —— 保留它会让 public/ 下的文件在 Worker 之前
+	 * 被直接输出，形成一条绕过清洗的通道。所有路径都必须过清洗后再交给 R2。
 	 */
-	// "placement": {  "mode": "smart" }
+	"r2_buckets": [
+		{
+			"binding": "BUCKET",
+			"bucket_name": "postpic"
+		}
+	],
+
 	/**
-	 * Bindings
-	 * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
-	 * databases, object storage, AI inference, real-time communication and more.
-	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
+	 * 自定义域。若 postpic.iicemeta.com 当前绑在 R2 桶的 Public Access 上，
+	 * 需先在 R2 侧解绑，否则 deploy 会报域名已被占用。
 	 */
+	"routes": [
+		{
+			"pattern": "postpic.iicemeta.com",
+			"custom_domain": true
+		}
+	],
+
+	"vars": {
+		/* 键策略 */
+		"ALLOWED_EXTENSIONS": "jpg,jpeg,jpe,png,webp,avif,gif,apng,ico,svg,bmp,tif,tiff,heic,heif,jxl,mp4,webm,mov,m4v,mp3,m4a,ogg,opus,wav,flac,pdf,json,txt,woff,woff2",
+		"ENFORCE_EXTENSION": "false",
+		"ALLOW_DOTFILES": "false",
+		"KEY_MAX_LENGTH": "1024",
+		"SEGMENT_MAX_LENGTH": "255",
+
+		/* 热链防护：允许的主机及其子域放行，无 Referer 放行 */
+		"HOTLINK_MODE": "block",
+		"ALLOWED_REFERER_HOSTS": "postpic.iicemeta.com,iicemeta.com",
+		"ALLOWED_ORIGIN_HOSTS": "postpic.iicemeta.com,iicemeta.com",
+		"CORP": "same-site",
+
+		/* 限流（单 isolate 令牌桶，best-effort） */
+		"RATE_LIMIT_MODE": "on",
+		"RATE_LIMIT_RPS": "25",
+		"RATE_LIMIT_BURST": "150",
+
+		/* 缓存 */
+		"CDN_CACHE_SECONDS": "604800",
+		"NOT_FOUND_CACHE_SECONDS": "60",
+		"MAX_CACHE_BYTES": "33554432",
+
+		/* Range 分片 */
+		"ALLOW_RANGE": "true"
+	}
+
 	/**
-	 * Environment Variables
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
-	 * Note: Use secrets to store sensitive data.
-	 * https://developers.cloudflare.com/workers/configuration/secrets/
+	 * URL 签名（可选，最强的一层）。启用：
+	 *   npx wrangler secret put URL_SIGNING_SECRET
+	 * 设置后所有请求必须带 ?exp=<unix秒>&sig=<hmac>，用 scripts/sign-url.mjs 生成。
+	 * 密钥走 secret，不要写进 vars。
 	 */
-	// "vars": {  "MY_VARIABLE": "production_value" }
-	/**
-	 * Service Bindings (communicate between multiple Workers)
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
-	 */
-	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ]
 }

@@ -1,0 +1,111 @@
+import type { Env } from "../types";
+
+export type HotlinkMode = "block" | "off";
+
+export interface FirewallConfig {
+  allowedExtensions: Set<string>;
+  enforceExtension: boolean;
+  allowDotfiles: boolean;
+  keyMaxLength: number;
+  segmentMaxLength: number;
+
+  hotlinkMode: HotlinkMode;
+  allowedRefererHosts: string[];
+  allowedOriginHosts: string[];
+  corp: string;
+
+  rateLimitEnabled: boolean;
+  rateLimitRps: number;
+  rateLimitBurst: number;
+
+  cacheSeconds: number;
+  notFoundCacheSeconds: number;
+  maxCacheBytes: number;
+
+  allowRange: boolean;
+  signingSecret: string | null;
+}
+
+const num = (raw: string | undefined, fallback: number, min = 0, max = Number.MAX_SAFE_INTEGER): number => {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+};
+
+const bool = (raw: string | undefined, fallback: boolean): boolean => {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+};
+
+const hostList = (raw: string | undefined): string[] =>
+  (raw ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length > 0 && s !== "*")
+    .map((s) => s.replace(/^\./, ""));
+
+const parse = (env: Env): FirewallConfig => {
+  const allowedRefererHosts = hostList(env.ALLOWED_REFERER_HOSTS);
+  const originHosts = hostList(env.ALLOWED_ORIGIN_HOSTS);
+
+  return {
+    allowedExtensions: new Set(
+      (env.ALLOWED_EXTENSIONS ?? "")
+        .split(",")
+        .map((s) => s.trim().toLowerCase().replace(/^\./, ""))
+        .filter((s) => s.length > 0),
+    ),
+    enforceExtension: bool(env.ENFORCE_EXTENSION, false),
+    allowDotfiles: bool(env.ALLOW_DOTFILES, false),
+    keyMaxLength: num(env.KEY_MAX_LENGTH, 1024, 1, 8192),
+    segmentMaxLength: num(env.SEGMENT_MAX_LENGTH, 255, 1, 1024),
+
+    hotlinkMode: (env.HOTLINK_MODE ?? "block").trim().toLowerCase() === "off" ? "off" : "block",
+    allowedRefererHosts,
+    allowedOriginHosts: originHosts.length > 0 ? originHosts : allowedRefererHosts,
+    corp: (env.CORP ?? "same-site").trim().toLowerCase(),
+
+    rateLimitEnabled: (env.RATE_LIMIT_MODE ?? "on").trim().toLowerCase() !== "off",
+    rateLimitRps: num(env.RATE_LIMIT_RPS, 25, 0.1, 10000),
+    rateLimitBurst: num(env.RATE_LIMIT_BURST, 150, 1, 100000),
+
+    cacheSeconds: num(env.CDN_CACHE_SECONDS, 604800, 0, 31536000),
+    notFoundCacheSeconds: num(env.NOT_FOUND_CACHE_SECONDS, 60, 0, 86400),
+    maxCacheBytes: num(env.MAX_CACHE_BYTES, 32 * 1024 * 1024, 0, 5 * 1024 ** 4),
+
+    allowRange: bool(env.ALLOW_RANGE, true),
+    signingSecret: (env.URL_SIGNING_SECRET ?? "").trim() || null,
+  };
+};
+
+let cached: { sig: string; cfg: FirewallConfig } | null = null;
+
+/** 解析配置；vars 在同一个 isolate 内不变，按签名缓存避免每请求重复解析 */
+export const getConfig = (env: Env): FirewallConfig => {
+  const sig = [
+    env.ALLOWED_EXTENSIONS,
+    env.ENFORCE_EXTENSION,
+    env.ALLOW_DOTFILES,
+    env.KEY_MAX_LENGTH,
+    env.SEGMENT_MAX_LENGTH,
+    env.HOTLINK_MODE,
+    env.ALLOWED_REFERER_HOSTS,
+    env.ALLOWED_ORIGIN_HOSTS,
+    env.CORP,
+    env.RATE_LIMIT_MODE,
+    env.RATE_LIMIT_RPS,
+    env.RATE_LIMIT_BURST,
+    env.CDN_CACHE_SECONDS,
+    env.NOT_FOUND_CACHE_SECONDS,
+    env.MAX_CACHE_BYTES,
+    env.ALLOW_RANGE,
+    env.URL_SIGNING_SECRET ? "s" : "",
+  ].join("\u0000");
+
+  if (cached && cached.sig === sig) return cached.cfg;
+  const cfg = parse(env);
+  cached = { sig, cfg };
+  return cfg;
+};

@@ -4,6 +4,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy --minify",
+    "typecheck": "tsc --noEmit",
+    "sign": "node scripts/sign-url.mjs",
     "cf-typegen": "wrangler types --env-interface CloudflareBindings"
   },
   "dependencies": {
@@ -11,6 +13,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
+    "typescript": "^5.9.3",
     "wrangler": "^4.156.0"
   }
 }
