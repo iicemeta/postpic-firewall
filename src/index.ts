@@ -11,6 +11,19 @@ const FIREWALL_ID = "postpic-firewall/1";
 const ALLOWED_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const SANDBOX_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
+/**
+ * 边缘缓存键的纪元号。
+ *
+ * caches.default 就是 Cloudflare 边缘缓存本体：R2 走自定义域直连的时期，图片已经
+ * 被缓进这一层，头是 R2 的默认值（max-age=14400、没有任何加固头）。Worker 上线后
+ * 用同一个键去 match，会把这些旧条目当成自己的缓存命中，于是 nosniff /
+ * Content-Disposition / CSP 全部丢失，浏览器还会按 4 小时缓存旧图。
+ *
+ * 加一个前缀把纪元隔开：新代码只认 /__fw-v1/ 下的条目，旧条目让它自己过期。
+ * 前缀拼接在 canonicalPath 之前，真实对象无论如何都撞不上这个键。
+ */
+const CACHE_EPOCH = "v1";
+
 const app = new Hono<{ Bindings: Env }>();
 
 const clientIp = (req: Request): string =>
@@ -81,12 +94,13 @@ const rebuild = (res: Response, mutate: (headers: Headers) => void): Response =>
 };
 
 /** 304：只回校验器，body 与 entity 头一律去掉 */
-const notModified = (source: Headers, cacheState: string): Response => {
+const notModified = (source: Headers, cacheState: string, cacheControl?: string): Response => {
   const headers = new Headers(source);
   headers.delete("Content-Type");
   headers.delete("Content-Disposition");
   headers.delete("Content-Length");
   headers.set("X-Firewall-Cache", cacheState);
+  if (cacheControl) headers.set("Cache-Control", cacheControl);
   return new Response(null, { status: 304, headers });
 };
 
@@ -208,19 +222,24 @@ app.all("*", async (c) => {
 
   const isHead = req.method === "HEAD";
   const range = cfg.allowRange ? req.headers.get("range") : null;
-  const cacheUrl = `https://${host}${canonicalPath(key)}`;
+  const cacheUrl = `https://${host}/__fw-${CACHE_EPOCH}${canonicalPath(key)}`;
   const headers = new Headers({ "X-Firewall": FIREWALL_ID });
 
   // ---- 7. 边缘缓存：同一对象只回源一次，重复请求不再产生 R2 操作 ----
   if (!range && !isHead) {
     const hit = await caches.default.match(cacheUrl);
     if (hit) {
+      // 缓存副本的 Cache-Control 已被 zone 的 Browser Cache TTL 改写成别的值
+      // （实测 3600 进、14400 出），这里按配置重新盖回，保证浏览器端看到的
+      // TTL 与 CDN_CACHE_SECONDS 一致，换图后不会被拖到 4 小时才更新。
+      const hitCacheControl = cacheControlFor(cfg, false);
       const hitEtag = hit.headers.get("ETag");
       if (hitEtag && etagMatches(req.headers.get("if-none-match"), hitEtag)) {
-        return notModified(hit.headers, "HIT");
+        return notModified(hit.headers, "HIT", hitCacheControl);
       }
       return rebuild(hit, (h) => {
         h.set("X-Firewall-Cache", "HIT");
+        h.set("Cache-Control", hitCacheControl);
         applyCors(h, origin, cfg);
       });
     }

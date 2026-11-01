@@ -82,7 +82,7 @@ R2 的成本不在存储，在**操作次数**（Class B 读）和**请求量**�
 | `KEY_MAX_LENGTH` / `SEGMENT_MAX_LENGTH` | `1024` / `255` | 键与单段长度上限 |
 | `HOTLINK_MODE` | `block` | `off` 关闭 Referer 检查 |
 | `HOTLINK_STRICT` | `false` | `true` 时要求必须带 Referer 或同站 `Sec-Fetch-Site`，连 curl 这类脚本客户端一起挡 |
-| `ALLOWED_REFERER_HOSTS` | `postpic.iicemeta.com,iicemeta.com` | 子域自动放行；无 Referer 且非 cross-site 放行 |
+| `ALLOWED_REFERER_HOSTS` | `www.iicemeta.com,iicemeta.com,postpic.iicemeta.com` | 博客在 `www.iicemeta.com`；`iicemeta.com` 按后缀匹配等于放行全部子域。无 Referer 且非 cross-site 放行 |
 | `ALLOWED_ORIGIN_HOSTS` | 同上 | CORS 反射白名单 |
 | `CORP` | `same-site` | `same-origin` / `cross-origin` / 空 = 不发 |
 | `RATE_LIMIT_MODE` / `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` | `on` / `40` / `800` | 令牌桶，装的是瞬时并发 |
@@ -125,16 +125,19 @@ MSYS_NO_PATHCONV=1 URL_SIGNING_SECRET=xxx npm run sign -- /2026/photo.jpg --ttl 
 
 签名对象是**清洗后的对象键**（无前导斜杠）与 `exp` 的 HMAC-SHA256，有效期上限 30 天。启用后所有请求都必须带签名，裸链接直接 403。
 
-## 上线注意
+## 上线状态与注意
 
-- `postpic.iicemeta.com` 若当前绑在 R2 桶的 Public Access 自定义域上，**先解绑**，否则 `deploy` 会报域名已被占用。解绑后公网访问只剩 Worker 一条入口，这是防火墙生效的前提。
+已部署，`postpic.iicemeta.com` 由 Worker 独占（R2 桶侧无任何自定义域，不存在域名争用）。DNS 记录由 `wrangler deploy` 的 custom domain 接管。
+
 - 本仓库已移除静态资源绑定（`assets`）：保留它会让 `public/` 下的文件在 Worker 之前被直出，等于留一条绕过清洗的通道。
 - Worker 只读桶，不提供上传接口；上传仍走你自己的流程。
+- **缓存纪元**：`caches.default` 与 Cloudflare 边缘缓存是同一层。R2 直连时期图片已被缓进这一层（R2 默认 `max-age=14400`、无任何加固头），Worker 若用同样格式的键去 `match()` 会把它们当成自己的缓存命中。因此缓存键带 `__fw-v1` 前缀（`index.ts` 的 `CACHE_EPOCH`），新旧彻底隔离；旧条目自行过期。改动缓存语义（响应头、编码方式）时需要递增这个纪元号。
+- 缓存副本的 `Cache-Control` 会被 zone 的 Browser Cache TTL 改写（实测 3600 进、14400 出），所以 HIT / 304 分支按配置重新盖回 `cacheControlFor()` 的结果，浏览器端 TTL 始终等于 `CDN_CACHE_SECONDS`。
 
 ## 已知边界
 
 - 限流与新键配额都是 **isolate 内存级**：N 个 isolate 就有 N 倍预算，冷启动会重置。挡单点刷量够用，扛不住分布式换 IP。要硬上限请叠加 Cloudflare WAF 速率规则（按 `ip` + `http.request.uri.path`）。
 - 默认只缓存 1 小时，是"换图要及时生效"和"少回源"之间的折中。因为对象名 `image.png` 会被同名覆盖，上了 immutable + 长 TTL 就等于换图要等一周。彻底解法是让文件名带内容 hash（`image-<hash>.png`），然后 `IMMUTABLE=true` + `CDN_CACHE_SECONDS=31536000`，可以做到永不回源。
 - 缓存过期后由 `stale-while-revalidate` 兜着：期间继续发旧图、后台回源刷新，避免图集页同时过期时把 R2 打出一波尖峰。
-- Range 请求不走边缘缓存，只做限流加权（每次 3 点）。纯图站建议 `ALLOW_RANGE=false`，让重复读全部落在缓存上。
+- Range 请求不走边缘缓存，限流上只计入口那 1 点（不追加回源权重）。纯图站建议 `ALLOW_RANGE=false`，让重复读全部落在缓存上。
 - 无 Referer 且 `Sec-Fetch-Site: cross-site` 才判盗链。要连"不带任何浏览器头"的脚本客户端一起挡，打开 `HOTLINK_STRICT`——代价是 wget / RSS 阅读器 / 图片代理全部 403。

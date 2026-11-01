@@ -25,8 +25,8 @@
 	],
 
 	/**
-	 * 自定义域。若 postpic.iicemeta.com 当前绑在 R2 桶的 Public Access 上，
-	 * 需先在 R2 侧解绑，否则 deploy 会报域名已被占用。
+	 * 自定义域：图床入口。R2 桶侧的 custom domain 已不存在（桶当前无任何自定义域），
+	 * 因此这里可以独占 postpic.iicemeta.com，deploy 会接管该域名的 DNS 记录。
 	 */
 	"routes": [
 		{
@@ -43,11 +43,18 @@
 		"KEY_MAX_LENGTH": "1024",
 		"SEGMENT_MAX_LENGTH": "255",
 
-		/* 热链防护：允许的主机及其子域放行，无 Referer 放行；cross-site 的 Sec-Fetch-Site 视为盗链 */
+		/*
+		 * 热链防护：允许的主机及其子域放行，无 Referer 放行；
+		 * cross-site 的 Sec-Fetch-Site 视为盗链（referrerPolicy=no-referrer 抹不掉这个头）。
+		 *
+		 * 博客实际域名是 www.iicemeta.com，裸域 301 到 www。
+		 * "iicemeta.com" 这一项按后缀匹配，等于放行全部子域（www / blog / viz ...），
+		 * 所以 www 本来就在范围内；这里仍显式列出，方便日后收紧时做替换而不是猜。
+		 */
 		"HOTLINK_MODE": "block",
 		"HOTLINK_STRICT": "false",
-		"ALLOWED_REFERER_HOSTS": "postpic.iicemeta.com,iicemeta.com",
-		"ALLOWED_ORIGIN_HOSTS": "postpic.iicemeta.com,iicemeta.com",
+		"ALLOWED_REFERER_HOSTS": "www.iicemeta.com,iicemeta.com,postpic.iicemeta.com",
+		"ALLOWED_ORIGIN_HOSTS": "www.iicemeta.com,iicemeta.com,postpic.iicemeta.com",
 		"CORP": "same-site",
 
 		/*

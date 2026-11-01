@@ -30,7 +30,9 @@ export interface Limits {
 
 /**
  * 消耗令牌。返回 true 表示放行。
- * cost 用于区分开销：命中边缘缓存 1，回源 R2 4，Range 分片 3。
+ *
+ * cost 是调用方按路径算好的：入口统一扣 1；只有"GET + 无 Range + 边缘缓存未命中"
+ * 会在回源前再扣 3（合计 4）。HEAD 与 Range 不进缓存分支，因此始终只扣 1。
  */
 export const takeToken = (identifier: string, cost: number, limits: Limits): boolean => {
   const now = Date.now();
